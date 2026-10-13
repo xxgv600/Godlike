@@ -162,17 +162,45 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None):
             except Exception as e:
                 print(f"[WARN] 点击切换入口失败: {e}", flush=True)
 
-            # 调试：页面上有几个 input
+            # 调试：打出所有 input 的属性，看新版 placeholder 到底是什么
             try:
-                n_inputs = page.evaluate("() => document.querySelectorAll('input').length")
-                print(f"[INFO] 页面 input 数量: {n_inputs}", flush=True)
+                inputs_info = page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll('input')).map(el => ({
+                        type: el.type,
+                        placeholder: el.placeholder || '',
+                        name: el.name || '',
+                        id: el.id || '',
+                        visible: el.offsetParent !== null
+                    }));
+                }""")
+                for idx, info in enumerate(inputs_info):
+                    print(f"[INFO] input[{idx}]: {info}", flush=True)
+            except Exception as e:
+                print(f"[WARN] input 调试失败: {e}", flush=True)
+
+            # 自适应找用户名/密码输入框（新版 placeholder 可能变了）
+            user_sel, pwd_sel = None, None
+            for sel in ['input[placeholder="Username or Email"]', 'input[type="email"]',
+                        'input[name="username"]', 'input[name="email"]', 'input[type="text"]']:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.is_visible(timeout=3000):
+                        user_sel = sel
+                        print(f"[INFO] 用户名输入框: {sel}", flush=True)
+                        break
+                except Exception:
+                    continue
+            try:
+                ploc = page.locator('input[type="password"]').first
+                if ploc.is_visible(timeout=3000):
+                    pwd_sel = 'input[type="password"]'
+                    print(f"[INFO] 密码输入框: {pwd_sel}", flush=True)
             except Exception:
                 pass
-
-            page.locator('input[placeholder="Username or Email"]').wait_for(state="visible", timeout=15000)
-            page.locator('input[placeholder="Password"]').wait_for(state="visible", timeout=15000)
-            page.fill('input[placeholder="Username or Email"]', user)
-            page.fill('input[placeholder="Password"]', pwd)
+            if not user_sel or not pwd_sel:
+                raise Exception(f"找不到登录输入框 (user={user_sel}, pwd={pwd_sel})")
+            page.fill(user_sel, user)
+            page.fill(pwd_sel, pwd)
             print("[INFO] 已填写账号密码，提交登录", flush=True)
 
             for sel in ['button[type="submit"]', 'button:has-text("Login")']:
