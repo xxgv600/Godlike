@@ -274,9 +274,19 @@ def oauth_login(user: str, pwd: str, proxy: str = None):
                     pass
 
             final_token = bearer_token or bearer_fallback
+
+            # 抓取浏览器 Cookie（新版面板可能用 Cookie 会话而非 Bearer）
+            cookies = {}
+            try:
+                for c in ctx.cookies():
+                    cookies[c["name"]] = c["value"]
+                print(f"[INFO] 抓到 {len(cookies)} 个 Cookie: {list(cookies.keys())[:6]}", flush=True)
+            except Exception as e:
+                print(f"[WARN] Cookie 获取失败: {e}", flush=True)
+
             print(f"[INFO] Token: {'OK' if final_token else '缺失'}, "
                   f"UUID: {'OK' if full_uuid else '缺失'}, 短ID: {short_id or '缺失'}", flush=True)
-            return final_token, full_uuid, short_id, fail_shot
+            return final_token, full_uuid, short_id, fail_shot, cookies
 
         except Exception as e:
             print(f"[ERROR] OAuth 登录异常: {e}", flush=True)
@@ -293,44 +303,48 @@ def oauth_login(user: str, pwd: str, proxy: str = None):
             browser.close()
 
 # ---------- API ----------
-def api_headers(tok: str) -> dict:
-    return {
-        "Authorization": f"Bearer {tok}",
+# 会话级 Cookie（OAuth 登录后填入，API 调用时自动带上）
+_api_cookies = {}
+
+def api_headers(tok: str = "") -> dict:
+    h = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/plain, */*",
         "Origin": FRONT_BASE,
         "Referer": f"{FRONT_BASE}/",
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+def _get(url: str, tok: str = "") -> dict:
+    try:
+        r = requests.get(url, headers=api_headers(tok), cookies=_api_cookies, timeout=30)
+        return r.json()
+    except Exception as e:
+        print(f"[ERROR] GET 失败 {url.split('/api/v2')[-1][:40]}: {e}", flush=True)
+        return {}
+
+def _post(url: str, tok: str = "", body: dict = None) -> dict:
+    try:
+        r = requests.post(url, headers=api_headers(tok), cookies=_api_cookies,
+                          json=body or {}, timeout=30)
+        return r.json()
+    except Exception as e:
+        print(f"[ERROR] POST 失败 {url.split('/api/v2')[-1][:40]}: {e}", flush=True)
+        return {}
 
 def check_video_status(uuid: str, tok: str) -> dict:
-    try:
-        r = requests.get(f"{API_BASE}/servers/{uuid}/free-renewal/video/status?type=youtube_iter1&locale=en",
-                         headers=api_headers(tok), timeout=30)
-        return r.json()
-    except Exception as e:
-        print(f"[ERROR] 状态查询失败: {e}", flush=True)
-        return {}
+    return _get(f"{API_BASE}/servers/{uuid}/free-renewal/video/status?type=youtube_iter1&locale=en", tok)
 
 def call_video_start(uuid: str, tok: str) -> dict:
-    try:
-        r = requests.post(f"{API_BASE}/servers/{uuid}/free-renewal/video/start?locale=en",
-                          headers=api_headers(tok), json={"type": "youtube_iter1"}, timeout=30)
-        return r.json()
-    except Exception as e:
-        print(f"[ERROR] Start API失败: {e}", flush=True)
-        return {}
+    return _post(f"{API_BASE}/servers/{uuid}/free-renewal/video/start?locale=en", tok, {"type": "youtube_iter1"})
 
 def call_update_once(uuid: str, tok: str, watch_uuid: str, rid: int, vt: int) -> dict:
-    try:
-        r = requests.post(f"{API_BASE}/servers/{uuid}/free-renewal/video/update-time?locale=en",
-                          headers=api_headers(tok),
-                          json={"uuid": watch_uuid, "renewal_uuid": watch_uuid,
-                                "renewal_id": rid, "video_time_watched": vt}, timeout=30)
-        return r.json()
-    except Exception as e:
-        print(f"[ERROR] update-time异常: {e}", flush=True)
-        return {}
+    return _post(f"{API_BASE}/servers/{uuid}/free-renewal/video/update-time?locale=en", tok,
+                 {"uuid": watch_uuid, "renewal_uuid": watch_uuid,
+                  "renewal_id": rid, "video_time_watched": vt})
 
 def simulate_video_watching(uuid: str, tok: str, watch_uuid: str, rid: int):
     steps = [30, 60, 90, 120, 150, 180, 210, 240]
@@ -366,11 +380,11 @@ def simulate_video_watching(uuid: str, tok: str, watch_uuid: str, rid: int):
 def get_ws_creds(uuid: str, tok: str):
     try:
         r = requests.get(f"{API_BASE}/servers/{uuid}/websocket?locale=en",
-                         headers=api_headers(tok), timeout=30)
+                         headers=api_headers(tok), cookies=_api_cookies, timeout=30)
         if r.status_code == 200:
             d = r.json().get("data", r.json())
             return d.get("token"), d.get("socket")
-        print(f"[ERROR] WS凭证失败: {r.status_code}", flush=True)
+        print(f"[ERROR] WS凭证失败: {r.status_code} {r.text[:120]}", flush=True)
         return None, None
     except Exception as e:
         print(f"[ERROR] WS凭证异常: {e}", flush=True)
@@ -468,11 +482,22 @@ def process_account(key: str, proxy: str = None) -> bool:
 
     print(f"\n{'='*60}\n[INFO] 处理 {key} ({mask_email(user)})\n{'='*60}", flush=True)
 
-    tok, full_uuid, short_id, shot = oauth_login(user, pwd, proxy)
-    if not tok:
-        print("[ERROR] 未能获取 Bearer Token", flush=True)
-        notify_tg(False, email=user, error_msg="OAuth 登录未获取到 Token", screenshot=shot)
+    login_res = oauth_login(user, pwd, proxy)
+    tok, full_uuid, short_id = login_res[0], login_res[1], login_res[2]
+    shot = login_res[3] if len(login_res) > 3 else None
+    login_cookies = login_res[4] if len(login_res) > 4 else {}
+    # 把浏览器 Cookie 注入 API 会话
+    global _api_cookies
+    _api_cookies = login_cookies or {}
+    if _api_cookies:
+        print(f"[INFO] API 将使用 {len(_api_cookies)} 个 Cookie 进行认证", flush=True)
+    if not tok and not _api_cookies:
+        print("[ERROR] 未能获取 Bearer Token 且无 Cookie", flush=True)
+        notify_tg(False, email=user, error_msg="OAuth 登录未获取到认证信息", screenshot=shot)
         return False
+    if not tok:
+        print("[INFO] 无 Bearer Token，改用 Cookie 会话调用 API", flush=True)
+        tok = ""
     if not full_uuid:
         print("[ERROR] 未能获取服务器 UUID", flush=True)
         notify_tg(False, email=user, error_msg="未获取到服务器 UUID", screenshot=shot)
