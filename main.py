@@ -220,6 +220,8 @@ def oauth_login(user: str, pwd: str, proxy: str = None):
             page.wait_for_timeout(3000)
 
             # ---- 7b. 尝试从 NextAuth session 端点拿 access token ----
+            # 先给 final_token 一个初始值（后面 session/localStorage 可能会更新它）
+            final_token = bearer_token or bearer_fallback
             if not final_token:
                 try:
                     sess = page.evaluate("""async () => {
@@ -304,7 +306,9 @@ def oauth_login(user: str, pwd: str, proxy: str = None):
                 except Exception:
                     pass
 
-            final_token = bearer_token or bearer_fallback
+            # localStorage 兜底（仅当 session 端点没拿到 token 时才用）
+            if not final_token:
+                final_token = bearer_token or bearer_fallback
 
             # 抓取浏览器 Cookie（新版面板可能用 Cookie 会话而非 Bearer）
             cookies = {}
