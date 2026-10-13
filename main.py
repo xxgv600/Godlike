@@ -203,16 +203,55 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None):
             page.fill(pwd_sel, pwd)
             print("[INFO] 已填写账号密码，提交登录", flush=True)
 
-            for sel in ['button[type="submit"]', 'button:has-text("Login")']:
+            # 点提交按钮，并记录是否点上
+            submitted = False
+            for sel in ['button[type="submit"]', 'button:has-text("Login")', 'button:has-text("Sign in")']:
                 try:
                     btn = page.locator(sel).first
-                    if btn.is_visible():
+                    if btn.is_visible(timeout=3000):
                         btn.click(timeout=5000)
+                        submitted = True
+                        print(f"[INFO] 已点击提交按钮: {sel}", flush=True)
                         break
-                except:
-                    pass
+                except Exception:
+                    continue
+            if not submitted:
+                # 兜底：直接按回车提交表单
+                try:
+                    page.locator(pwd_sel).first.press("Enter")
+                    submitted = True
+                    print("[INFO] 用回车提交表单", flush=True)
+                except Exception as e:
+                    print(f"[WARN] 回车提交失败: {e}", flush=True)
+            if not submitted:
+                print("[WARN] 没找到可点的提交按钮", flush=True)
 
             page.wait_for_timeout(5000)
+
+            # 诊断：登录后页面状态
+            try:
+                title = page.title()
+                print(f"[INFO] 登录后标题: {title}", flush=True)
+                # 找页面上的错误提示
+                err_text = page.evaluate("""() => {
+                    const els = Array.from(document.querySelectorAll('*'));
+                    const keywords = ['error', 'invalid', 'incorrect', 'wrong', 'failed', '错误', '失败', '不正确'];
+                    for (const el of els) {
+                        if (el.children.length > 0) continue;
+                        const t = (el.textContent || '').trim();
+                        if (t.length > 0 && t.length < 200) {
+                            const low = t.toLowerCase();
+                            for (const k of keywords) {
+                                if (low.includes(k)) return t;
+                            }
+                        }
+                    }
+                    return '';
+                }""")
+                if err_text:
+                    print(f"[INFO] 页面错误提示: {err_text}", flush=True)
+            except Exception as e:
+                print(f"[WARN] 登录后诊断失败: {e}", flush=True)
 
             for _ in range(5):
                 for sel in ['button:has-text("Go to my server")', 'button:has-text("Skip")']:
