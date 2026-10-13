@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Godlike 主机自动续期 + 开机脚本
+2026-10-14 修复：面板前端已从 ultra.panel.godlike.host 迁移至 panel.godlike.host
 """
 
 import os, sys, time, traceback, random, json, re, asyncio
@@ -13,7 +14,9 @@ import websockets
 from playwright.sync_api import sync_playwright
 
 # ---------- 配置 ----------
-FRONT_BASE = "https://ultra.panel.godlike.host"
+# 2026-10 更新：ultra.panel.godlike.host/login 已无登录表单，仅剩跳转链接
+# 面板前端现位于 panel.godlike.host
+FRONT_BASE = "https://panel.godlike.host"
 API_BASE = "https://panel.godlike.host/api/v2"
 LOGIN_URL = f"{FRONT_BASE}/login"
 OUTPUT_DIR = Path("scripts/Godlike")
@@ -77,18 +80,24 @@ def notify_tg(ok: bool, email: str = "", server: str = "",
         print(f"[WARN] TG 通知发送失败: {e}", flush=True)
 
 # ---------- 登录并获取 Bearer Token + UUID ----------
-def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def login_and_get_token(user: str, pwd: str, proxy: str = None):
     bearer_token = None
+    bearer_fallback = None  # 非 ptlc_ 的 Bearer token 备用
     full_uuid = None
     short_id = None
+    fail_shot = None
 
     def on_request(request):
-        nonlocal bearer_token, full_uuid, short_id
+        nonlocal bearer_token, bearer_fallback, full_uuid, short_id
         auth = request.headers.get("authorization", "")
-        if auth.startswith("Bearer ") and "ptlc_" in auth:
+        if auth.startswith("Bearer "):
             token = auth.replace("Bearer ", "").strip()
-            if bearer_token != token:
-                bearer_token = token
+            if token:
+                if "ptlc_" in token:
+                    if bearer_token != token:
+                        bearer_token = token
+                elif not bearer_fallback:
+                    bearer_fallback = token
         url = request.url
         m = re.search(r'/servers/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', url)
         if m and not full_uuid:
@@ -108,18 +117,25 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
         page.on("request", on_request)
 
         try:
+            print(f"[INFO] 打开登录页: {LOGIN_URL}", flush=True)
             page.goto(LOGIN_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(3000)
 
-            switch = page.locator('button:has-text("Through login/password")')
-            switch.wait_for(state="visible", timeout=15000)
-            switch.click()
-            page.wait_for_timeout(2000)
+            # 登录方式切换按钮（新版页面可能直接显示表单，此步可选）
+            try:
+                switch = page.locator('button:has-text("Through login/password")')
+                switch.wait_for(state="visible", timeout=10000)
+                switch.click()
+                page.wait_for_timeout(2000)
+                print("[INFO] 已切换到账号密码登录", flush=True)
+            except Exception:
+                print("[INFO] 未找到切换按钮，直接使用当前表单", flush=True)
 
             page.locator('input[placeholder="Username or Email"]').wait_for(state="visible", timeout=15000)
             page.locator('input[placeholder="Password"]').wait_for(state="visible", timeout=15000)
             page.fill('input[placeholder="Username or Email"]', user)
             page.fill('input[placeholder="Password"]', pwd)
+            print("[INFO] 已填写账号密码，提交登录", flush=True)
 
             for sel in ['button[type="submit"]', 'button:has-text("Login")']:
                 try:
@@ -146,6 +162,8 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
                     break
                 page.wait_for_timeout(1000)
 
+            print(f"[INFO] 登录后 URL: {page.url[:80]}", flush=True)
+
             if not short_id:
                 if '/server/' in page.url:
                     parts = page.url.rstrip('/').split('/')
@@ -165,7 +183,7 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
                         if short_id:
                             break
 
-            if short_id and not bearer_token:
+            if short_id and not bearer_token and not bearer_fallback:
                 page.goto(f"{FRONT_BASE}/server/{short_id}", wait_until="domcontentloaded")
                 page.wait_for_load_state("networkidle")
                 page.wait_for_timeout(3000)
@@ -182,12 +200,39 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None) -> Tuple[Optiona
                 except:
                     pass
 
-            return bearer_token, full_uuid, short_id
+            # 兜底：从 localStorage 找 token
+            if not bearer_token and not bearer_fallback:
+                try:
+                    for key in ["token", "auth_token", "access_token", "api_token", "ptlc_token", "jwt"]:
+                        val = page.evaluate(
+                            f"() => {{ try {{ return localStorage.getItem('{key}'); }} catch(e) {{ return null; }} }}")
+                        if val and len(str(val)) > 20:
+                            bearer_fallback = str(val).strip()
+                            print(f"[INFO] 从 localStorage 找到 token (key={key})", flush=True)
+                            break
+                except Exception as e:
+                    print(f"[WARN] localStorage 读取失败: {e}", flush=True)
+
+            # ptlc_ 优先，否则用备用 token
+            final_token = bearer_token or bearer_fallback
+            if final_token and not bearer_token:
+                print("[INFO] 使用备用 Bearer token（非 ptlc_ 前缀）", flush=True)
+
+            print(f"[INFO] Token: {'已获取' if final_token else '未获取'}, "
+                  f"UUID: {'已获取' if full_uuid else '未获取'}, 短ID: {short_id or '未获取'}", flush=True)
+
+            return final_token, full_uuid, short_id, fail_shot
 
         except Exception as e:
             print(f"[ERROR] 登录异常: {e}", flush=True)
             traceback.print_exc()
-            return None, None, None
+            try:
+                fail_shot = snapshot("login_fail")
+                page.screenshot(path=fail_shot)
+                print(f"[INFO] 已保存失败截图: {fail_shot}", flush=True)
+            except Exception:
+                pass
+            return None, None, None, fail_shot
         finally:
             context.close()
             browser.close()
@@ -249,7 +294,7 @@ def simulate_video_watching(full_uuid: str, bearer_token: str,
     wait_seconds = 28
     total = len(steps) * wait_seconds
 
-    print(f"[INFO] 开始续期（共{len(steps)}步 × {wait_seconds}s，预计{total}s）", flush=True)
+    print(f"[INFO] 开始续期（共{len(steps)}步 x {wait_seconds}s，预计{total}s）", flush=True)
 
     last_resp = {}
     for i, video_time in enumerate(steps):
@@ -276,14 +321,14 @@ def simulate_video_watching(full_uuid: str, bearer_token: str,
                         new_timer = resp2.get("new_free_timer")
                         steps[i+1:] = [adjusted + 30*(j+1) for j in range(len(steps)-i-1)]
                         if new_timer:
-                            print(f"[INFO] ✅ 续期完成 new_free_timer={new_timer}", flush=True)
+                            print(f"[INFO] 续期完成 new_free_timer={new_timer}", flush=True)
                             return True, new_timer
                         continue
                     return False, resp2.get("message", "重试失败")
             return False, msg
 
         if new_timer:
-            print(f"[INFO] ✅ 续期完成 new_free_timer={new_timer}", flush=True)
+            print(f"[INFO] 续期完成 new_free_timer={new_timer}", flush=True)
             return True, new_timer
 
     new_timer = last_resp.get("new_free_timer")
@@ -307,19 +352,11 @@ def get_websocket_credentials(full_uuid: str, bearer_token: str) -> Tuple[Option
 
 # ---------- WebSocket 开机 ----------
 async def ws_start_server(socket_url: str, jwt: str) -> str:
-    """
-    返回值:
-      "already_running" - 服务器已在运行，无需开机
-      "started"         - 已发送开机指令并确认启动
-      "sent"            - 已发送开机指令，等待超时但指令已发出
-      "auth_failed"     - WS认证失败
-      "error"           - 其他异常
-    """
     print(f"[INFO] 连接 WebSocket...", flush=True)
     try:
         async with websockets.connect(
             socket_url,
-            origin="https://ultra.panel.godlike.host",
+            origin=FRONT_BASE,
             additional_headers={
                 "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
             },
@@ -327,7 +364,6 @@ async def ws_start_server(socket_url: str, jwt: str) -> str:
             ping_timeout=20,
             close_timeout=10,
         ) as ws:
-            # 认证
             await ws.send(json.dumps({"event": "auth", "args": [jwt]}))
 
             auth_success = False
@@ -337,7 +373,7 @@ async def ws_start_server(socket_url: str, jwt: str) -> str:
                     data = json.loads(msg)
                     if data.get("event") == "auth success":
                         auth_success = True
-                        print("[INFO] ✅ WS认证成功", flush=True)
+                        print("[INFO] WS认证成功", flush=True)
                         break
                 except asyncio.TimeoutError:
                     break
@@ -346,7 +382,6 @@ async def ws_start_server(socket_url: str, jwt: str) -> str:
                 print("[ERROR] WS认证失败", flush=True)
                 return "auth_failed"
 
-            # 收集服务器推送的初始状态（最多等 5s）
             current_status = "unknown"
             deadline = asyncio.get_event_loop().time() + 5
             while asyncio.get_event_loop().time() < deadline:
@@ -360,7 +395,6 @@ async def ws_start_server(socket_url: str, jwt: str) -> str:
                         current_status = data.get("args", ["unknown"])[0]
                         print(f"[INFO] 服务器当前状态: {current_status}", flush=True)
                         break
-
                     elif event == "stats":
                         try:
                             state = json.loads(data["args"][0]).get("state", "")
@@ -370,22 +404,18 @@ async def ws_start_server(socket_url: str, jwt: str) -> str:
                                 break
                         except Exception:
                             pass
-
                 except asyncio.TimeoutError:
                     break
                 except Exception:
                     break
 
-            # 已在运行/启动中 → 无需发开机指令
             if current_status in ("running", "starting"):
                 print(f"[INFO] 服务器已在运行中（{current_status}），无需开机", flush=True)
                 return "already_running"
 
-            # 未运行 → 发送开机指令
             await ws.send(json.dumps({"event": "set state", "args": ["start"]}))
             print("[INFO] 已发送开机指令，等待启动...", flush=True)
 
-            # 等待状态变更确认
             for _ in range(60):
                 try:
                     msg = await asyncio.wait_for(ws.recv(), timeout=5)
@@ -396,18 +426,16 @@ async def ws_start_server(socket_url: str, jwt: str) -> str:
                         new_status = data.get("args", [""])[0]
                         print(f"[INFO] 状态变更: {new_status}", flush=True)
                         if new_status in ("starting", "running"):
-                            print(f"[INFO] ✅ 服务器启动成功（{new_status}）", flush=True)
+                            print(f"[INFO] 服务器启动成功（{new_status}）", flush=True)
                             return "started"
-
                     elif event == "stats":
                         try:
                             state = json.loads(data["args"][0]).get("state", "")
                             if state in ("starting", "running"):
-                                print(f"[INFO] ✅ 服务器启动成功（{state}）", flush=True)
+                                print(f"[INFO] 服务器启动成功（{state}）", flush=True)
                                 return "started"
                         except Exception:
                             pass
-
                 except asyncio.TimeoutError:
                     continue
                 except Exception:
@@ -447,26 +475,26 @@ def process_account(key: str, proxy: str = None) -> bool:
         notify_tg(False, error_msg="格式错误")
         return False
 
-    # 工作流日志使用脱敏值
     masked = mask_email(user)
     print(f"\n{'='*60}", flush=True)
     print(f"[INFO] 处理 {key} ({masked})", flush=True)
     print(f"{'='*60}", flush=True)
 
     # 1. 登录
-    bearer_token, full_uuid, short_id = login_and_get_token(user, pwd, proxy)
+    login_result = login_and_get_token(user, pwd, proxy)
+    bearer_token, full_uuid, short_id = login_result[0], login_result[1], login_result[2]
+    fail_shot = login_result[3] if len(login_result) > 3 else None
     if not bearer_token:
         print("[ERROR] 未能获取 Bearer Token", flush=True)
-        notify_tg(False, email=user, error_msg="未能获取 Bearer Token")
+        notify_tg(False, email=user, error_msg="未能获取 Bearer Token", screenshot=fail_shot)
         return False
     if not full_uuid:
         print("[ERROR] 未能获取服务器 UUID", flush=True)
-        notify_tg(False, email=user, error_msg="未能获取服务器 UUID")
+        notify_tg(False, email=user, error_msg="未能获取服务器 UUID", screenshot=fail_shot)
         return False
 
-    # 工作流日志中服务器ID也脱敏
     masked_server = mask_server(short_id)
-    print(f"[INFO] 🔑 登录成功 | 服务器: {masked_server}", flush=True)
+    print(f"[INFO] 登录成功 | 服务器: {masked_server}", flush=True)
 
     # 2. 检查续期状态
     status = check_video_status(full_uuid, bearer_token)
@@ -502,7 +530,6 @@ def process_account(key: str, proxy: str = None) -> bool:
             notify_tg(False, email=user, server=short_id, error_msg=result)
             return False
 
-        # 确认冷却时间
         time.sleep(2)
         status_after = check_video_status(full_uuid, bearer_token)
         time_until = status_after.get("time_until_next_video") or 0
@@ -516,13 +543,13 @@ def process_account(key: str, proxy: str = None) -> bool:
     start_result = start_server_via_ws(full_uuid, bearer_token)
 
     start_note_map = {
-        "already_running": "✅ 服务器已在运行中，无需开机",
-        "started":         "✅ 开机成功",
-        "sent":            "✅ 开机指令已发送（等待超时）",
-        "auth_failed":     "⚠️ WS认证失败",
-        "error":           "⚠️ 开机异常",
+        "already_running": "服务器已在运行中，无需开机",
+        "started":         "开机成功",
+        "sent":            "开机指令已发送（等待超时）",
+        "auth_failed":     "WS认证失败",
+        "error":           "开机异常",
     }
-    start_note = start_note_map.get(start_result, "⚠️ 未知状态")
+    start_note = start_note_map.get(start_result, "未知状态")
     print(f"[INFO] {start_note}", flush=True)
 
     # 5. TG 通知（使用真实邮箱和服务器ID）
@@ -533,7 +560,7 @@ def process_account(key: str, proxy: str = None) -> bool:
         after=f"{cooldown_after}\n{start_note}",
     )
 
-    print(f"[INFO] ✅ {key} 处理完成", flush=True)
+    print(f"[INFO] {key} 处理完成", flush=True)
     return renew_ok
 
 def main():
@@ -557,7 +584,7 @@ def main():
             time.sleep(random.randint(5, 15))
 
     if all_ok:
-        print("\n[INFO] 🎉 所有账号处理成功", flush=True)
+        print("\n[INFO] 所有账号处理成功", flush=True)
         sys.exit(0)
     else:
         print("\n[ERROR] 部分账号失败", flush=True)
