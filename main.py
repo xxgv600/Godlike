@@ -121,15 +121,27 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None):
             page.goto(LOGIN_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(3000)
 
-            # 登录方式切换按钮（新版页面可能直接显示表单，此步可选）
+            # 先关 cookie 弹窗（如果有），免得挡住点击
+            for cookie_sel in ['button:has-text("Reject All")', 'button:has-text("Accept All")']:
+                try:
+                    cbtn = page.locator(cookie_sel).first
+                    if cbtn.is_visible(timeout=3000):
+                        cbtn.click()
+                        print("[INFO] 已关闭 cookie 弹窗", flush=True)
+                        page.wait_for_timeout(1000)
+                        break
+                except Exception:
+                    pass
+
+            # 点 "Through login/password"（注意：新版页面上它是纯文本，不是 <button>）
             try:
-                switch = page.locator('button:has-text("Through login/password")')
+                switch = page.get_by_text("Through login/password", exact=False)
                 switch.wait_for(state="visible", timeout=10000)
                 switch.click()
                 page.wait_for_timeout(2000)
                 print("[INFO] 已切换到账号密码登录", flush=True)
-            except Exception:
-                print("[INFO] 未找到切换按钮，直接使用当前表单", flush=True)
+            except Exception as e:
+                print(f"[INFO] 未找到切换入口，直接使用当前表单: {e}", flush=True)
 
             page.locator('input[placeholder="Username or Email"]').wait_for(state="visible", timeout=15000)
             page.locator('input[placeholder="Password"]').wait_for(state="visible", timeout=15000)
