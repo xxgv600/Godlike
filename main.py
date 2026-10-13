@@ -219,6 +219,37 @@ def oauth_login(user: str, pwd: str, proxy: str = None):
                 print(f"[WARN] 等待回面板超时，当前: {page.url[:80]}", flush=True)
             page.wait_for_timeout(3000)
 
+            # ---- 7b. 尝试从 NextAuth session 端点拿 access token ----
+            if not final_token:
+                try:
+                    sess = page.evaluate("""async () => {
+                        try {
+                            const r = await fetch('/api/auth/session');
+                            if (!r.ok) return {error: 'http_' + r.status};
+                            return await r.json();
+                        } catch(e) { return {error: String(e)}; }
+                    }""")
+                    print(f"[INFO] session 端点返回: {str(sess)[:250]}", flush=True)
+                    if isinstance(sess, dict):
+                        for k in ["accessToken", "access_token", "token", "jwt", "idToken"]:
+                            if sess.get(k) and len(str(sess[k])) > 20:
+                                final_token = str(sess[k])
+                                print(f"[INFO] 从 session 拿到 token (字段={k})", flush=True)
+                                break
+                        # 有些实现把 token 藏在 user 或 data 下
+                        if not final_token:
+                            for container in [sess.get("user"), sess.get("data")]:
+                                if isinstance(container, dict):
+                                    for k in ["accessToken", "access_token", "token"]:
+                                        if container.get(k) and len(str(container[k])) > 20:
+                                            final_token = str(container[k])
+                                            print(f"[INFO] 从 session.user/data 拿到 token (字段={k})", flush=True)
+                                            break
+                                if final_token:
+                                    break
+                except Exception as e:
+                    print(f"[WARN] session 端点查询失败: {e}", flush=True)
+
             # ---- 8. 从 URL 或链接提取 short_id ----
             if not short_id and '/server/' in page.url:
                 parts = page.url.rstrip('/').split('/')
