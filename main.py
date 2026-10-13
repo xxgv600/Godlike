@@ -121,27 +121,53 @@ def login_and_get_token(user: str, pwd: str, proxy: str = None):
             page.goto(LOGIN_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(3000)
 
-            # 先关 cookie 弹窗（如果有），免得挡住点击
-            for cookie_sel in ['button:has-text("Reject All")', 'button:has-text("Accept All")']:
-                try:
-                    cbtn = page.locator(cookie_sel).first
-                    if cbtn.is_visible(timeout=3000):
-                        cbtn.click()
-                        print("[INFO] 已关闭 cookie 弹窗", flush=True)
-                        page.wait_for_timeout(1000)
-                        break
-                except Exception:
-                    pass
-
-            # 点 "Through login/password"（注意：新版页面上它是纯文本，不是 <button>）
+            # 先用 JS 关 cookie 弹窗（如果有）
             try:
-                switch = page.get_by_text("Through login/password", exact=False)
-                switch.wait_for(state="visible", timeout=10000)
-                switch.click()
-                page.wait_for_timeout(2000)
-                print("[INFO] 已切换到账号密码登录", flush=True)
+                closed = page.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('button'));
+                    for (const b of btns) {
+                        const t = (b.textContent || '').trim();
+                        if (t === 'Reject All' || t === 'Accept All') { b.click(); return t; }
+                    }
+                    return null;
+                }""")
+                if closed:
+                    print(f"[INFO] 已关闭 cookie 弹窗 ({closed})", flush=True)
+                page.wait_for_timeout(1000)
             except Exception as e:
-                print(f"[INFO] 未找到切换入口，直接使用当前表单: {e}", flush=True)
+                print(f"[WARN] cookie 弹窗处理失败: {e}", flush=True)
+
+            # 用 JS 点 "Through login/password"（纯文本元素，JS 点最稳）
+            try:
+                clicked = page.evaluate("""() => {
+                    const els = Array.from(document.querySelectorAll('*'));
+                    for (const el of els) {
+                        const t = (el.textContent || '').trim();
+                        if (t === 'Through login/password' && el.children.length === 0) {
+                            el.click();
+                            return 'leaf:' + el.tagName;
+                        }
+                    }
+                    for (const el of els) {
+                        const t = (el.textContent || '').trim();
+                        if (t === 'Through login/password') {
+                            el.click();
+                            return 'fallback:' + el.tagName;
+                        }
+                    }
+                    return null;
+                }""")
+                print(f"[INFO] 点击切换入口: {clicked}", flush=True)
+                page.wait_for_timeout(2000)
+            except Exception as e:
+                print(f"[WARN] 点击切换入口失败: {e}", flush=True)
+
+            # 调试：页面上有几个 input
+            try:
+                n_inputs = page.evaluate("() => document.querySelectorAll('input').length")
+                print(f"[INFO] 页面 input 数量: {n_inputs}", flush=True)
+            except Exception:
+                pass
 
             page.locator('input[placeholder="Username or Email"]').wait_for(state="visible", timeout=15000)
             page.locator('input[placeholder="Password"]').wait_for(state="visible", timeout=15000)
